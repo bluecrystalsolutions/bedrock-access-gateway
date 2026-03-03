@@ -103,7 +103,7 @@ USAGE | user=admin@example.com | chat=abc-123 | model=anthropic.claude-sonnet-4-
 To use this fork with all enhancements merged:
 
 ```bash
-git clone https://github.com/<YOUR_USERNAME>/bedrock-access-gateway.git
+git clone https://github.com/bluecrystalsolutions/bedrock-access-gateway.git
 cd bedrock-access-gateway
 git checkout my-contributions
 ```
