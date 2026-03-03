@@ -10,27 +10,12 @@ This is a fork of the [Bedrock Access Gateway](https://github.com/aws-samples/be
 
 The following pull requests have been submitted upstream. Each branch is independent and can be reviewed/merged separately.
 
-### PR 0 — Enhanced Validation Error Handler
-
-| | |
-|---|---|
-| **Branch** | [`fix/enhanced-validation-errors`](../../tree/fix/enhanced-validation-errors) |
-| **PR** | [#TODO](https://github.com/aws-samples/bedrock-access-gateway/pull/TODO) |
-| **Status** | 🟡 Pending review |
-
-Improves the validation error handler to log error count and per-field details at WARNING level. Before this change, validation failures only logged the first line of the exception, making it hard to diagnose which field caused the rejection.
-
-**Files:** `src/api/app.py`
-
----
-
 ### PR 1 — Prompt Caching Schema Support
 
 | | |
 |---|---|
 | **Branch** | [`feature/prompt-caching-schema`](../../tree/feature/prompt-caching-schema) |
-| **PR** | [#TODO](https://github.com/aws-samples/bedrock-access-gateway/pull/TODO) |
-| **Status** | 🟡 Pending review |
+| **Status** | 🟢 [PR 230](https://github.com/aws-samples/bedrock-access-gateway/pull/230) |
 
 Adds support for [Anthropic-style prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching) through the OpenAI-compatible API. Clients can now send structured system/developer messages with `cache_control` markers, which are translated to Bedrock's `cachePoint` blocks.
 
@@ -49,8 +34,7 @@ Adds support for [Anthropic-style prompt caching](https://docs.anthropic.com/en/
 | | |
 |---|---|
 | **Branch** | [`feature/configurable-max-tokens`](../../tree/feature/configurable-max-tokens) |
-| **PR** | [#TODO](https://github.com/aws-samples/bedrock-access-gateway/pull/TODO) |
-| **Status** | 🟡 Pending review |
+| **Status** | 🟢 [PR 228](https://github.com/aws-samples/bedrock-access-gateway/pull/228) |
 
 Makes the default `max_tokens` value configurable via the `DEFAULT_MAX_TOKENS` environment variable (default: 2048, preserving existing behaviour). Also introduces `effective_max_tokens` which prefers `max_completion_tokens` over `max_tokens`, eliminating duplicate logic in the request parser.
 
@@ -69,17 +53,19 @@ Makes the default `max_tokens` value configurable via the `DEFAULT_MAX_TOKENS` e
 | | |
 |---|---|
 | **Branch** | [`feature/logging-overhaul`](../../tree/feature/logging-overhaul) |
-| **PR** | [#TODO](https://github.com/aws-samples/bedrock-access-gateway/pull/TODO) |
-| **Status** | 🟡 Pending review |
+| **Status** | 🟢 [PR 226](https://github.com/aws-samples/bedrock-access-gateway/pull/226) |
 
 Comprehensive logging improvement that replaces the binary `if DEBUG: logger.info()` pattern with a three-tier system (INFO → DEBUG → TRACE) and adds per-request USAGE logging at INFO level.
 
 **Key changes:**
-- Custom TRACE level (5) below DEBUG (10) for per-chunk streaming logs
-- All 17 `if DEBUG: logger.info` patterns converted to `logger.debug` or TRACE
+- Custom TRACE level (5) below DEBUG (10) for per-chunk streaming logs, centralised in `setting.py` and imported everywhere
+- All `if DEBUG: logger.info` patterns converted to `logger.debug` or TRACE with lazy `%s` formatting
+- Expensive debug operations guarded with `isEnabledFor` checks
+- ECS/Fargate-aware log format — omits timestamps and brackets when `ECS_CONTAINER_METADATA_URI` is set (CloudWatch adds its own)
 - INFO-level USAGE log line per request: user, chat, model, tokens in/out/cache, user-agent
 - Configurable header extraction for user/chat attribution (proxy-agnostic)
-- TRACE-level request body logging in validation handler and chat endpoint
+- Improved validation error handler with error count at WARNING and rejected body at TRACE
+- Only `api` logger hierarchy gets DEBUG/TRACE — boto3/botocore/urllib3 stay at INFO
 
 **New environment variables:**
 
@@ -116,7 +102,7 @@ git checkout feature/logging-overhaul
 
 ## Merge Compatibility
 
-All 4 PRs are independent branches off `main` and have been verified to merge cleanly together. The only interaction is a trivial conflict between PR0 and PR3 in `src/api/app.py` (both modify the validation handler — resolution is to keep both changes).
+All 3 PRs are independent branches off `main` and have been verified to merge cleanly together. There are no conflicts between the branches.
 
 ## License
 
