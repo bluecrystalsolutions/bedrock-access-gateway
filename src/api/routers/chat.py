@@ -39,6 +39,42 @@ async def chat_completions(
         ),
     ],
 ):
+    # DIAG: Log raw body size and compare raw vs parsed message counts
+    try:
+        raw_body = await request.body()
+        raw_body_size = len(raw_body)
+        raw_json = json.loads(raw_body)
+        raw_msg_count = len(raw_json.get("messages", []))
+        raw_msg_roles = [m.get("role", "?") for m in raw_json.get("messages", [])]
+        parsed_msg_count = len(chat_request.messages)
+        parsed_msg_roles = [m.role for m in chat_request.messages]
+        logger.warning(
+            "DIAG-BODY | body_size=%d | raw_messages=%d | parsed_messages=%d | raw_roles=%s | parsed_roles=%s",
+            raw_body_size, raw_msg_count, parsed_msg_count,
+            raw_msg_roles, parsed_msg_roles,
+        )
+        if raw_msg_count != parsed_msg_count:
+            logger.error(
+                "DIAG-MISMATCH | %d messages in raw body but %d after Pydantic parsing! Messages may have been dropped.",
+                raw_msg_count, parsed_msg_count,
+            )
+            # Log details of each raw message to identify which ones were dropped
+            for i, raw_msg in enumerate(raw_json.get("messages", [])):
+                role = raw_msg.get("role", "?")
+                content = raw_msg.get("content")
+                content_type = type(content).__name__
+                content_preview = ""
+                if isinstance(content, str):
+                    content_preview = content[:100]
+                elif isinstance(content, list):
+                    content_preview = str([{k: v for k, v in item.items() if k == "type"} if isinstance(item, dict) else type(item).__name__ for item in content[:5]])
+                logger.error(
+                    "DIAG-RAW-MSG[%d] | role=%s | content_type=%s | has_tool_calls=%s | preview=%s",
+                    i, role, content_type, bool(raw_msg.get("tool_calls")), content_preview,
+                )
+    except Exception as e:
+        logger.warning("DIAG-BODY failed: %s", str(e))
+
     if logger.isEnabledFor(TRACE_LEVEL):
         logger.log(
             TRACE_LEVEL,

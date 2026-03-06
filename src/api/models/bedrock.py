@@ -376,6 +376,38 @@ class BedrockModel(BaseChatModel):
 
         # convert OpenAI chat request to Bedrock SDK request
         args = self._parse_request(chat_request)
+
+        # DIAG: Log Bedrock message structure summary before sending
+        bedrock_msgs = args.get("messages", [])
+        diag_summary = []
+        for i, msg in enumerate(bedrock_msgs):
+            role = msg.get("role", "?")
+            content = msg.get("content", [])
+            content_types = []
+            tool_use_ids = []
+            tool_result_ids = []
+            for block in (content if isinstance(content, list) else []):
+                if isinstance(block, dict):
+                    if "text" in block:
+                        content_types.append("text")
+                    elif "toolUse" in block:
+                        content_types.append("toolUse")
+                        tool_use_ids.append(block["toolUse"].get("toolUseId", "?"))
+                    elif "toolResult" in block:
+                        content_types.append("toolResult")
+                        tool_result_ids.append(block["toolResult"].get("toolUseId", "?"))
+                    elif "cachePoint" in block:
+                        content_types.append("cachePoint")
+                    else:
+                        content_types.append("unknown:" + ",".join(block.keys()))
+            diag_summary.append(
+                f"[{i}] role={role} blocks={content_types} toolUseIds={tool_use_ids} toolResultIds={tool_result_ids}"
+            )
+        logger.warning(
+            "DIAG-BEDROCK | model=%s | bedrock_msg_count=%d | structure:\n%s",
+            chat_request.model, len(bedrock_msgs), "\n".join(diag_summary),
+        )
+
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Bedrock request: " + json.dumps(str(args)))
 
@@ -584,7 +616,7 @@ class BedrockModel(BaseChatModel):
         https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html#message-inference-examples
         """
         messages = []
-        for message in chat_request.messages:
+        for idx, message in enumerate(chat_request.messages):
             if isinstance(message, UserMessage):
                 messages.append(
                     {
@@ -603,6 +635,13 @@ class BedrockModel(BaseChatModel):
                     has_content = len(message.content) > 0
                 elif message.content is not None:
                     has_content = True
+
+                # DIAG: Log assistant message parsing decisions
+                tool_call_ids = [tc.id for tc in message.tool_calls] if message.tool_calls else []
+                logger.warning(
+                    "DIAG-PARSE[%d] | role=assistant | content_type=%s | has_content=%s | tool_calls=%s | tool_call_ids=%s",
+                    idx, type(message.content).__name__, has_content, bool(message.tool_calls), tool_call_ids,
+                )
 
                 if has_content:
                     # Text message
