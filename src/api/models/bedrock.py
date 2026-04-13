@@ -49,6 +49,7 @@ from api.setting import (
     ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_APPLICATION_INFERENCE_PROFILES,
     ENABLE_PROMPT_CACHING,
+    INFERENCE_PROFILE_REGIONS,
     TRACE_LEVEL,
 )
 
@@ -108,6 +109,19 @@ NO_ASSISTANT_PREFILL_MODELS = {
 }
 
 
+def _profile_matches_region_filter(profile_id: str) -> bool:
+    """Check if a SYSTEM_DEFINED profile ID matches the INFERENCE_PROFILE_REGIONS filter.
+
+    Profile IDs look like "au.anthropic.claude-opus-4-6-v1" where "au" is the
+    region prefix.  When INFERENCE_PROFILE_REGIONS is set (e.g. ["au", "us"]),
+    only profiles starting with one of those prefixes followed by "." are included.
+    When INFERENCE_PROFILE_REGIONS is empty (default), all profiles match.
+    """
+    if not INFERENCE_PROFILE_REGIONS:
+        return True  # No filter → include everything
+    return any(profile_id.startswith(f"{prefix}.") for prefix in INFERENCE_PROFILE_REGIONS)
+
+
 def list_bedrock_models() -> dict:
     """Automatically getting a list of supported models.
 
@@ -115,29 +129,45 @@ def list_bedrock_models() -> dict:
         - ON_DEMAND models.
         - Cross-Region Inference Profiles (if enabled via Env)
         - Application Inference Profiles (if enabled via Env)
+        - Inference-profile-only models (always included — no ON_DEMAND alternative)
+
+    Note: SYSTEM_DEFINED profiles are always fetched into profile_metadata
+    for feature detection (_resolve_to_foundation_model), even when
+    ENABLE_CROSS_REGION_INFERENCE is false. The flag only controls whether
+    those profile IDs appear in the model list for models that also support
+    ON_DEMAND invocation.
+
+    When INFERENCE_PROFILE_REGIONS is set (e.g. "au" or "au,us"), only
+    SYSTEM_DEFINED profiles matching those region prefixes are listed.
     """
     model_list = {}
     try:
-        if ENABLE_CROSS_REGION_INFERENCE:
-            # List system defined inference profile IDs and store underlying model mapping
-            paginator = bedrock_client.get_paginator('list_inference_profiles')
-            for page in paginator.paginate(maxResults=1000, typeEquals="SYSTEM_DEFINED"):
-                for profile in page["inferenceProfileSummaries"]:
-                    profile_id = profile.get("inferenceProfileId")
-                    if not profile_id:
-                        continue
+        # Always fetch SYSTEM_DEFINED inference profiles into profile_metadata.
+        # This is needed for:
+        # 1. Feature detection via _resolve_to_foundation_model() (prompt caching,
+        #    temperature/topP conflicts, etc.)
+        # 2. Listing inference-profile-only models that have no ON_DEMAND support
+        #    (e.g. newer Claude/Nova models) — these MUST be invoked via a profile
+        # The ENABLE_CROSS_REGION_INFERENCE flag controls whether profile IDs are
+        # added to the model list for models that ALSO support ON_DEMAND.
+        paginator = bedrock_client.get_paginator('list_inference_profiles')
+        for page in paginator.paginate(maxResults=1000, typeEquals="SYSTEM_DEFINED"):
+            for profile in page["inferenceProfileSummaries"]:
+                profile_id = profile.get("inferenceProfileId")
+                if not profile_id:
+                    continue
 
-                    # Extract underlying model from first model in the profile
-                    models = profile.get("models", [])
-                    if models:
-                        model_arn = models[0].get("modelArn", "")
-                        if model_arn:
-                            # Extract foundation model ID from ARN
-                            model_id = model_arn.split('/')[-1]
-                            profile_metadata[profile_id] = {
-                                "underlying_model_id": model_id,
-                                "profile_type": "SYSTEM_DEFINED",
-                            }
+                # Extract underlying model from first model in the profile
+                models = profile.get("models", [])
+                if models:
+                    model_arn = models[0].get("modelArn", "")
+                    if model_arn:
+                        # Extract foundation model ID from ARN
+                        model_id = model_arn.split('/')[-1]
+                        profile_metadata[profile_id] = {
+                            "underlying_model_id": model_id,
+                            "profile_type": "SYSTEM_DEFINED",
+                        }
 
         if ENABLE_APPLICATION_INFERENCE_PROFILES:
             # List application defined inference profile IDs and create mapping
@@ -174,6 +204,12 @@ def list_bedrock_models() -> dict:
                         logger.warning(f"Error processing application profile: {e}")
                         continue
 
+        if INFERENCE_PROFILE_REGIONS:
+            logger.info(
+                "INFERENCE_PROFILE_REGIONS filter active: %s",
+                ", ".join(INFERENCE_PROFILE_REGIONS),
+            )
+
         # List foundation models, only cares about text outputs here.
         response = bedrock_client.list_foundation_models(byOutputModality="TEXT")
 
@@ -188,14 +224,32 @@ def list_bedrock_models() -> dict:
 
             inference_types = model.get("inferenceTypesSupported", [])
             input_modalities = model["inputModalities"]
+            has_on_demand = "ON_DEMAND" in inference_types
+
             # Add on-demand model list
-            if "ON_DEMAND" in inference_types:
+            if has_on_demand:
                 model_list[model_id] = {"modalities": input_modalities}
 
-            # Add all inference profiles (cross-region and application) for this model
+            # Add inference profiles for this model.
+            # Profile inclusion logic:
+            # - APPLICATION profiles: always included (controlled by own flag above)
+            # - SYSTEM_DEFINED profiles when ENABLE_CROSS_REGION_INFERENCE=true: included
+            #   (subject to INFERENCE_PROFILE_REGIONS filter if set)
+            # - SYSTEM_DEFINED profiles when ENABLE_CROSS_REGION_INFERENCE=false:
+            #   only included for inference-profile-only models (no ON_DEMAND),
+            #   because these models CANNOT be invoked any other way
+            #   (also subject to INFERENCE_PROFILE_REGIONS filter if set)
             for profile_id, metadata in profile_metadata.items():
-                if metadata.get("underlying_model_id") == model_id:
+                if metadata.get("underlying_model_id") != model_id:
+                    continue
+
+                profile_type = metadata.get("profile_type")
+                if profile_type == "APPLICATION":
                     model_list[profile_id] = {"modalities": input_modalities}
+                elif profile_type == "SYSTEM_DEFINED":
+                    if ENABLE_CROSS_REGION_INFERENCE or not has_on_demand:
+                        if _profile_matches_region_filter(profile_id):
+                            model_list[profile_id] = {"modalities": input_modalities}
 
     except Exception as e:
         logger.error(f"Unable to list models: {str(e)}")

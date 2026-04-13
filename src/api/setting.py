@@ -25,6 +25,17 @@ ENABLE_CROSS_REGION_INFERENCE = os.environ.get("ENABLE_CROSS_REGION_INFERENCE", 
 ENABLE_APPLICATION_INFERENCE_PROFILES = os.environ.get("ENABLE_APPLICATION_INFERENCE_PROFILES", "true").lower() != "false"
 ENABLE_PROMPT_CACHING = os.environ.get("ENABLE_PROMPT_CACHING", "false").lower() != "false"
 
+# Comma-separated list of region prefixes to include for SYSTEM_DEFINED inference
+# profiles.  When set, only profiles whose ID starts with one of these prefixes
+# are listed (e.g. "au" → only au.*, "au,us" → au.* and us.*).
+# Empty string (default) means include ALL regions.
+# Profiles are always fetched for feature detection; this only controls visibility.
+_raw_regions = os.environ.get("INFERENCE_PROFILE_REGIONS", "").strip()
+INFERENCE_PROFILE_REGIONS: list[str] = (
+    [r.strip().rstrip(".") for r in _raw_regions.split(",") if r.strip()]
+    if _raw_regions else []
+)
+
 # HTTP headers to extract for USAGE logging (configurable for different frontends).
 # Leave unset to omit user/chat from USAGE lines. Set to the header names your
 # upstream proxy sends, e.g. USAGE_USER_HEADER=x-openwebui-user-email
