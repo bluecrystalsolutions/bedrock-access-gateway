@@ -295,10 +295,14 @@ class BedrockModel(BaseChatModel):
             user_agent,
         )
 
-    def list_models(self) -> list[str]:
-        """Always refresh the latest model list"""
+    async def list_models(self) -> list[str]:
+        """Always refresh the latest model list.
+
+        Runs the synchronous boto3 pagination calls in a thread so the
+        asyncio event loop is not blocked.
+        """
         global bedrock_model_list
-        bedrock_model_list = list_bedrock_models()
+        bedrock_model_list = await run_in_threadpool(list_bedrock_models)
         return list(bedrock_model_list.keys())
 
     def validate(self, chat_request: ChatRequest):
@@ -531,9 +535,17 @@ class BedrockModel(BaseChatModel):
         return chat_response
 
     async def _async_iterate(self, stream):
-        """Helper method to convert sync iterator to async iterator"""
-        for chunk in stream:
-            await run_in_threadpool(lambda: chunk)
+        """Helper method to convert sync iterator to async iterator.
+
+        Each blocking next() call on the synchronous boto3 EventStream is
+        executed in a thread so the asyncio event loop stays responsive.
+        """
+        _sentinel = object()
+        iterator = iter(stream)
+        while True:
+            chunk = await run_in_threadpool(next, iterator, _sentinel)
+            if chunk is _sentinel:
+                break
             yield chunk
 
     async def chat_stream(self, chat_request: ChatRequest) -> AsyncIterable[bytes]:
