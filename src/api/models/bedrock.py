@@ -557,6 +557,7 @@ class BedrockModel(BaseChatModel):
             self.think_emitted = False
             self._tool_call_index_map = {}   # contentBlockIndex -> 0-based tool_calls index
             self._next_tool_index = 0
+            self._tool_call_has_args = {}    # contentBlockIndex -> True if non-empty args received
             reasoning_tokens = 0
             async for chunk in self._async_iterate(stream):
                 # Accumulate reasoning tokens from delta chunks before processing
@@ -1219,19 +1220,36 @@ class BedrockModel(BaseChatModel):
                 # tool use delta — look up the 0-based tool index we assigned at start
                 block_idx = chunk["contentBlockDelta"]["contentBlockIndex"]
                 index = self._tool_call_index_map.get(block_idx, 0)
-                # Bedrock sends empty string for tools with no arguments,
-                # but OpenAI sends "{}" (empty JSON object).  Pipecat's
-                # BaseOpenAILLMService only accumulates arguments when the
-                # value is truthy, and silently drops the tool call when
-                # arguments stay empty.  Map "" → "{}" for compatibility.
-                raw_input = delta["toolUse"]["input"]
-                tool_arguments = raw_input if raw_input else "{}"
+                tool_arguments = delta["toolUse"]["input"]
+                # Skip empty initial delta that Bedrock sends before actual JSON.
+                # We track non-empty deltas to detect no-arg tool calls; the
+                # synthetic "{}" is emitted at contentBlockStop if needed.
+                if tool_arguments:
+                    self._tool_call_has_args[block_idx] = True
+                    message = ChatResponseMessage(
+                        tool_calls=[
+                            ToolCall(
+                                index=index,
+                                function=ResponseFunction(
+                                    arguments=tool_arguments,
+                                ),
+                            )
+                        ]
+                    )
+
+        if "contentBlockStop" in chunk:
+            # If a tool call block ended with no non-empty argument deltas,
+            # emit a synthetic "{}" so clients (e.g. pipecat) that require
+            # truthy arguments see valid empty-object JSON.
+            block_idx = chunk["contentBlockStop"]["contentBlockIndex"]
+            if block_idx in self._tool_call_index_map and not self._tool_call_has_args.get(block_idx, False):
+                tool_idx = self._tool_call_index_map[block_idx]
                 message = ChatResponseMessage(
                     tool_calls=[
                         ToolCall(
-                            index=index,
+                            index=tool_idx,
                             function=ResponseFunction(
-                                arguments=tool_arguments,
+                                arguments="{}",
                             ),
                         )
                     ]
