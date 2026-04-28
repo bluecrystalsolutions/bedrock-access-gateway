@@ -555,6 +555,8 @@ class BedrockModel(BaseChatModel):
             message_id = self.generate_message_id()
             stream = response.get("stream")
             self.think_emitted = False
+            self._tool_call_index_map = {}   # contentBlockIndex -> 0-based tool_calls index
+            self._next_tool_index = 0
             reasoning_tokens = 0
             async for chunk in self._async_iterate(stream):
                 # Accumulate reasoning tokens from delta chunks before processing
@@ -1165,8 +1167,15 @@ class BedrockModel(BaseChatModel):
             # tool call start
             delta = chunk["contentBlockStart"]["start"]
             if "toolUse" in delta:
-                # first index is content
-                index = chunk["contentBlockStart"]["contentBlockIndex"] - 1
+                # Map Bedrock contentBlockIndex to sequential 0-based tool_calls index.
+                # Bedrock numbers ALL content blocks (text, reasoning, tool_use) with
+                # contentBlockIndex, but OpenAI tool_calls[].index must be 0-based
+                # across tool calls only.  The old ``- 1`` assumed index-0 is always
+                # text, which fails when the model emits a tool call first (index=-1).
+                block_idx = chunk["contentBlockStart"]["contentBlockIndex"]
+                index = self._next_tool_index
+                self._tool_call_index_map[block_idx] = index
+                self._next_tool_index += 1
                 message = ChatResponseMessage(
                     tool_calls=[
                         ToolCall(
@@ -1207,14 +1216,22 @@ class BedrockModel(BaseChatModel):
                     else:
                         return None  # Ignore signature if no <think> started
             else:
-                # tool use
-                index = chunk["contentBlockDelta"]["contentBlockIndex"] - 1
+                # tool use delta — look up the 0-based tool index we assigned at start
+                block_idx = chunk["contentBlockDelta"]["contentBlockIndex"]
+                index = self._tool_call_index_map.get(block_idx, 0)
+                # Bedrock sends empty string for tools with no arguments,
+                # but OpenAI sends "{}" (empty JSON object).  Pipecat's
+                # BaseOpenAILLMService only accumulates arguments when the
+                # value is truthy, and silently drops the tool call when
+                # arguments stay empty.  Map "" → "{}" for compatibility.
+                raw_input = delta["toolUse"]["input"]
+                tool_arguments = raw_input if raw_input else "{}"
                 message = ChatResponseMessage(
                     tool_calls=[
                         ToolCall(
                             index=index,
                             function=ResponseFunction(
-                                arguments=delta["toolUse"]["input"],
+                                arguments=tool_arguments,
                             ),
                         )
                     ]
