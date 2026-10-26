@@ -108,6 +108,22 @@ NO_ASSISTANT_PREFILL_MODELS = {
     "claude-opus-4-6",
 }
 
+# Learned cache of resolved foundation-model IDs that have been observed to
+# reject the legacy `reasoning_config={"type":"enabled",...}` extended
+# thinking scheme and require the newer `thinking.type=adaptive` +
+# `output_config.effort` scheme instead (see _invoke_bedrock's retry logic).
+#
+# This is NOT a hardcoded list — it starts empty and is populated at
+# runtime the first time a given model 400s with Bedrock's "use adaptive
+# thinking instead" error. From then on (for the lifetime of this process),
+# _parse_request consults this set and builds the adaptive-scheme request
+# directly, skipping the failed-attempt round trip for every subsequent
+# request to that model. This keeps the one-extra-request cost to "once per
+# model per process restart" rather than "every single request", while
+# still requiring no manual model-version maintenance as Anthropic ships
+# new Claude generations.
+ADAPTIVE_THINKING_MODELS: set[str] = set()
+
 
 def _profile_matches_region_filter(profile_id: str) -> bool:
     """Check if a SYSTEM_DEFINED profile ID matches the INFERENCE_PROFILE_REGIONS filter.
@@ -419,6 +435,62 @@ class BedrockModel(BaseChatModel):
 
         return None
 
+    @staticmethod
+    def _is_adaptive_thinking_required_error(error_message: str) -> bool:
+        """Detect Bedrock's "use adaptive thinking instead" validation error.
+
+        Newer Claude generations (observed starting with Opus 4.7/4.8 and
+        all Sonnet/Opus/Haiku 5.x models) reject the legacy
+        ``thinking.type=enabled`` / ``reasoning_config`` scheme with this
+        specific message, and ask callers to use
+        ``thinking.type=adaptive`` + ``output_config.effort`` instead.
+        Matching on the message (rather than a hardcoded model-id list)
+        keeps this working automatically as Anthropic ships new model
+        generations with unpredictable version numbers (e.g. opus-4-6 and
+        opus-4-8 are on opposite sides of this split).
+        """
+        return (
+            "thinking.type.enabled" in error_message
+            and "adaptive" in error_message
+        )
+
+    @staticmethod
+    def _uses_legacy_reasoning_config(args: dict) -> bool:
+        """Check whether the request we just sent used the legacy scheme."""
+        fields = args.get("additionalModelRequestFields") or {}
+        return "reasoning_config" in fields
+
+    @staticmethod
+    def _build_adaptive_thinking_fields(
+        reasoning_effort: Literal["low", "medium", "high"] | None,
+    ) -> dict:
+        """Build the new-style adaptive thinking additionalModelRequestFields.
+
+        Per the Bedrock ValidationException guidance: use
+        ``thinking: {"type": "adaptive"}`` together with a sibling
+        ``output_config: {"effort": ...}``. Bedrock's "adaptive" mode does
+        not take a budget_tokens value - effort is a coarse low/medium/high
+        knob instead.
+
+        ``display: "summarized"`` is REQUIRED to get non-empty
+        ``reasoningContent.text`` back from Bedrock. Without it, Bedrock
+        still emits signed reasoning blocks (contentBlockStart +
+        contentBlockDelta + signature), but the ``text`` field inside is
+        always empty - confirmed via a direct boto3 converse_stream A/B
+        test (bypassing both this gateway and ZooCode) on
+        2026-10-24: identical requests differing only in the presence of
+        this field went from 0 chars of reasoning text to 756 chars.
+        ZooCode's own direct-Bedrock provider (src/api/providers/bedrock.ts)
+        has always set this field; this gateway's adaptive-thinking path
+        did not, which is why reasoning text appeared empty when routed
+        through this gateway. See ZOOCODE_ANALYSIS.md (doc-repo) for the
+        full investigation write-up.
+        """
+        return {
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": reasoning_effort or "low"},
+        }
+
     async def _invoke_bedrock(self, chat_request: ChatRequest, stream=False):
         """Common logic for invoke bedrock models"""
         if logger.isEnabledFor(logging.DEBUG):
@@ -479,8 +551,56 @@ class BedrockModel(BaseChatModel):
                 # Run the blocking boto3 call in a thread pool
                 response = await run_in_threadpool(bedrock_runtime.converse, **args)
         except bedrock_runtime.exceptions.ValidationException as e:
-            logger.error("Bedrock validation error for model %s: %s", chat_request.model, str(e))
-            raise HTTPException(status_code=400, detail=str(e))
+            # Newer Claude generations (e.g. Opus 4.7+, Sonnet 5+) only support
+            # Bedrock's "adaptive" thinking mode and reject the legacy
+            # reasoning_config={"type": "enabled", ...} scheme we build by
+            # default for reasoning_effort requests. Rather than hardcoding a
+            # model-version allow-list (which goes stale the moment the next
+            # Claude generation ships), detect AWS's own error message and
+            # retry once with the new scheme.
+            if self._is_adaptive_thinking_required_error(
+                str(e)
+            ) and self._uses_legacy_reasoning_config(args):
+                logger.warning(
+                    "Model %s rejected legacy reasoning_config (adaptive-only model); "
+                    "retrying with thinking.type=adaptive + output_config.effort. "
+                    "Original error: %s",
+                    chat_request.model,
+                    str(e),
+                )
+                args["additionalModelRequestFields"] = self._build_adaptive_thinking_fields(
+                    chat_request.reasoning_effort
+                )
+                try:
+                    if stream:
+                        response = await run_in_threadpool(
+                            bedrock_runtime.converse_stream, **args
+                        )
+                    else:
+                        response = await run_in_threadpool(
+                            bedrock_runtime.converse, **args
+                        )
+                    # Retry succeeded - learn this model for next time so
+                    # future requests skip straight to the adaptive scheme
+                    # instead of paying for a failed attempt every time.
+                    resolved_model = self._resolve_to_foundation_model(chat_request.model)
+                    if resolved_model not in ADAPTIVE_THINKING_MODELS:
+                        ADAPTIVE_THINKING_MODELS.add(resolved_model)
+                        logger.info(
+                            "Learned that %s requires adaptive thinking; "
+                            "future requests will skip the legacy attempt.",
+                            resolved_model,
+                        )
+                except bedrock_runtime.exceptions.ValidationException as e2:
+                    logger.error(
+                        "Bedrock validation error for model %s even after adaptive-thinking retry: %s",
+                        chat_request.model,
+                        str(e2),
+                    )
+                    raise HTTPException(status_code=400, detail=str(e2))
+            else:
+                logger.error("Bedrock validation error for model %s: %s", chat_request.model, str(e))
+                raise HTTPException(status_code=400, detail=str(e))
         except bedrock_runtime.exceptions.ThrottlingException as e:
             logger.warning("Bedrock throttling for model %s: %s", chat_request.model, str(e))
             raise HTTPException(status_code=429, detail=str(e))
@@ -973,18 +1093,34 @@ class BedrockModel(BaseChatModel):
             model_lower = resolved_model.lower()
 
             if "anthropic.claude" in model_lower:
-                # Claude format: reasoning_config = object with budget_tokens
+                # Claude format.
                 # effective_max_tokens already prefers max_completion_tokens over max_tokens
-                budget_tokens = self._calc_budget_tokens(
-                    effective_max_tokens, chat_request.reasoning_effort
-                )
                 inference_config["maxTokens"] = effective_max_tokens
                 # unset topP - Not supported
                 inference_config.pop("topP", None)
 
-                args["additionalModelRequestFields"] = {
-                    "reasoning_config": {"type": "enabled", "budget_tokens": budget_tokens}
-                }
+                if resolved_model in ADAPTIVE_THINKING_MODELS:
+                    # Previously learned (this process) that this model only
+                    # accepts the newer adaptive-thinking scheme - build it
+                    # directly and skip the doomed legacy attempt + retry
+                    # round trip. See ADAPTIVE_THINKING_MODELS and
+                    # _invoke_bedrock's retry logic for how this gets
+                    # populated.
+                    args["additionalModelRequestFields"] = self._build_adaptive_thinking_fields(
+                        chat_request.reasoning_effort
+                    )
+                else:
+                    # Default: legacy extended-thinking scheme. Works for
+                    # Claude 3.7 through most 4.x models. If the model
+                    # actually requires the adaptive scheme instead,
+                    # _invoke_bedrock will catch Bedrock's 400, learn it
+                    # into ADAPTIVE_THINKING_MODELS, and retry once.
+                    budget_tokens = self._calc_budget_tokens(
+                        effective_max_tokens, chat_request.reasoning_effort
+                    )
+                    args["additionalModelRequestFields"] = {
+                        "reasoning_config": {"type": "enabled", "budget_tokens": budget_tokens}
+                    }
             elif "deepseek.v3" in model_lower or "deepseek.deepseek-v3" in model_lower:
                 # DeepSeek v3 format: reasoning_config = string ('low', 'medium', 'high')
                 # From Bedrock Playground: {"reasoning_config": "high"}
