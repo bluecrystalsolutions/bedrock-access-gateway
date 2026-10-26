@@ -46,7 +46,7 @@ class ImageUrl(BaseModel):
 
 
 class ImageContent(BaseModel):
-    type: Literal["image_url"] = "image"
+    type: Literal["image_url"] = "image_url"
     image_url: ImageUrl
 
 
@@ -111,8 +111,8 @@ class ChatRequest(BaseModel):
     temperature: float | None = Field(default=None, le=2.0, ge=0.0)
     top_p: float | None = Field(default=None, le=1.0, ge=0.0)
     user: str | None = None  # Not used
-    max_tokens: int | None = DEFAULT_MAX_TOKENS
-    max_completion_tokens: int | None = None
+    max_tokens: int | None = Field(default=DEFAULT_MAX_TOKENS, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     n: int | None = 1  # Not used
     tools: list[Tool] | None = None

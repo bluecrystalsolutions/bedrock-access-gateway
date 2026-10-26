@@ -41,3 +41,13 @@ INFERENCE_PROFILE_REGIONS: list[str] = (
 # upstream proxy sends, e.g. USAGE_USER_HEADER=x-openwebui-user-email
 USAGE_USER_HEADER = os.environ.get("USAGE_USER_HEADER", "")
 USAGE_CHAT_ID_HEADER = os.environ.get("USAGE_CHAT_ID_HEADER", "")
+
+# Multimodal image inputs may reference a remote URL that the gateway fetches on
+# behalf of the caller. See api/image_url.py for the checks applied to that URL.
+ENABLE_IMAGE_URL_FETCH = os.environ.get("ENABLE_IMAGE_URL_FETCH", "true").lower() != "false"
+# Optional comma-separated allowlist of hosts an image url may point at.
+# Empty means any host that resolves to a globally routable address is allowed.
+IMAGE_URL_ALLOWED_HOSTS = frozenset(
+    host.strip().lower() for host in os.environ.get("IMAGE_URL_ALLOWED_HOSTS", "").split(",") if host.strip()
+)
+IMAGE_URL_MAX_SIZE_MB = int(os.environ.get("IMAGE_URL_MAX_SIZE_MB", "10"))

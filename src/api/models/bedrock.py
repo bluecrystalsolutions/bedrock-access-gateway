@@ -9,12 +9,12 @@ from typing import AsyncIterable, Iterable, Literal
 
 import boto3
 import numpy as np
-import requests
 import tiktoken
 from botocore.config import Config
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 
+from api.image_url import parse_image_url
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
 from api.schema import (
     AssistantMessage,
@@ -97,6 +97,7 @@ profile_metadata = {}
 # When both are provided, temperature takes precedence and topP is removed
 TEMPERATURE_TOPP_CONFLICT_MODELS = {
     "claude-sonnet-4-5",
+    "claude-sonnet-4-6",
     "claude-haiku-4-5",
     "claude-opus-4-5",
 }
@@ -1044,16 +1045,16 @@ class BedrockModel(BaseChatModel):
         messages = self._parse_messages(chat_request)
         system_prompts = self._parse_system_prompts(chat_request)
 
-        # Base inference parameters.
-        # Prefer max_completion_tokens (OpenAI newer field) over max_tokens (legacy).
         effective_max_tokens = (
             chat_request.max_completion_tokens
             if chat_request.max_completion_tokens is not None
             else chat_request.max_tokens
         )
-        inference_config = {
-            "maxTokens": effective_max_tokens,
-        }
+
+        # Base inference parameters.
+        inference_config = {}
+        if effective_max_tokens is not None:
+            inference_config["maxTokens"] = effective_max_tokens
 
         # Only include optional parameters when specified
         if chat_request.temperature is not None:
@@ -1061,7 +1062,7 @@ class BedrockModel(BaseChatModel):
         if chat_request.top_p is not None:
             inference_config["topP"] = chat_request.top_p
 
-        # Some models (Claude Sonnet 4.5, Haiku 4.5) don't support both temperature and topP
+        # Some models (Claude Sonnet 4.5, Claude Sonnet 4.6, Haiku 4.5) don't support both temperature and topP
         # When both are provided, keep temperature and remove topP
         # Resolve profile to underlying model for feature detection
         resolved_model = self._resolve_to_foundation_model(chat_request.model)
@@ -1093,7 +1094,12 @@ class BedrockModel(BaseChatModel):
             model_lower = resolved_model.lower()
 
             if "anthropic.claude" in model_lower:
-                # Claude format.
+                # Claude format: reasoning_config with budget_tokens or adaptive thinking.
+                if effective_max_tokens is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="max_tokens or max_completion_tokens must be set when using reasoning_effort with Claude models",
+                    )
                 # effective_max_tokens already prefers max_completion_tokens over max_tokens
                 inference_config["maxTokens"] = effective_max_tokens
                 # unset topP - Not supported
@@ -1160,8 +1166,10 @@ class BedrockModel(BaseChatModel):
             }
 
             if additional_fields:
-                # Only set additionalModelRequestFields if there are actual fields to pass
-                args["additionalModelRequestFields"] = additional_fields
+                # Merge with existing additionalModelRequestFields (e.g., from reasoning_effort)
+                existing = args.get("additionalModelRequestFields", {})
+                existing.update(additional_fields)
+                args["additionalModelRequestFields"] = existing
 
                 # Extended thinking doesn't support both temperature and topP
                 # Remove topP to avoid validation error
@@ -1476,31 +1484,15 @@ class BedrockModel(BaseChatModel):
     def _parse_image(self, image_url: str) -> tuple[bytes, str]:
         """Try to get the raw data from an image url.
 
+        Accepts an inline base64 data url, or a remote http(s) url which the
+        gateway validates before fetching so that a caller cannot reach internal
+        endpoints through the proxy. Only supports 'image/jpeg', 'image/png',
+        'image/gif' or 'image/webp'.
+
         Ref: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ImageSource.html
         returns a tuple of (Image Data, Content Type)
         """
-        pattern = r"^data:(image/[a-z]*);base64,\s*"
-        content_type = re.search(pattern, image_url)
-        # if already base64 encoded.
-        # Only supports 'image/jpeg', 'image/png', 'image/gif' or 'image/webp'
-        if content_type:
-            image_data = re.sub(pattern, "", image_url)
-            return base64.b64decode(image_data), content_type.group(1)
-
-        # Send a request to the image URL
-        response = requests.get(image_url, timeout=30)
-        # Check if the request was successful
-        if response.status_code == 200:
-            content_type = response.headers.get("Content-Type")
-            if not content_type.startswith("image"):
-                content_type = "image/jpeg"
-            # Get the image content
-            image_content = response.content
-            return image_content, content_type
-        else:
-            raise HTTPException(
-                status_code=500, detail="Unable to access the image url"
-            )
+        return parse_image_url(image_url)
 
     def _parse_content_parts(
         self,
@@ -1829,7 +1821,7 @@ def get_embeddings_model(model_id: str) -> BedrockEmbeddingsModel:
     match model_name:
         case "Cohere Embed Multilingual" | "Cohere Embed English":
             return CohereEmbeddingsModel()
-        case "Titan Embeddings G2 - Text":
+        case "Titan Embeddings G1 - Text" | "Titan Embeddings G2 - Text":
             return TitanEmbeddingsModel()
         case "Nova Multimodal Embeddings V2":
             return NovaEmbeddingsModel()

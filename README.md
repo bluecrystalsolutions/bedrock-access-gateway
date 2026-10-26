@@ -2,6 +2,11 @@
 
 > Fork of [aws-samples/bedrock-access-gateway](https://github.com/aws-samples/bedrock-access-gateway) with enhancements for production logging, prompt caching, and operational visibility.
 
+> [!IMPORTANT]
+> **Upstream is deprecated.** Amazon Bedrock now serves OpenAI-compatible and
+> Anthropic-compatible APIs natively. See [Migrating to native Amazon Bedrock APIs](#migrating-to-native-amazon-bedrock-apis) below.
+> This fork preserves enhancements not available upstream (USAGE logging, prompt caching schema, adaptive thinking, etc.).
+
 ## Upstream
 
 This is a fork of the [Bedrock Access Gateway](https://github.com/aws-samples/bedrock-access-gateway) project by AWS Samples. The upstream project provides an OpenAI-compatible API proxy for Amazon Bedrock, enabling drop-in replacement for applications built against the OpenAI SDK.
@@ -103,6 +108,23 @@ git checkout feature/logging-overhaul
 ## Merge Compatibility
 
 All 3 PRs are independent branches off `main` and have been verified to merge cleanly together. There are no conflicts between the branches.
+
+## Migrating to native Amazon Bedrock APIs
+
+Point your SDK at the [`bedrock-mantle`](https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html) endpoint:
+
+- **Claude models** — native [Anthropic Messages API](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-messages-api.html), so the Anthropic SDKs work unchanged.
+- **GPT and other first- and third-party models** — OpenAI-compatible [Chat Completions](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-chat-completions-mantle.html) and [Responses](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html) APIs, so the OpenAI SDKs work unchanged.
+
+Beyond replacing this proxy, `bedrock-mantle` adds per-application [cost attribution](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-mgmt-projects.html), server-side tools, background inference and higher throughput limits. See [Endpoints supported by Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html) to compare it with `bedrock-runtime`.
+
+## Security
+
+See the [Security Guide](./docs/Security.md) for how to enable HTTPS on the ALB and how to configure the
+controls around remote image URL fetching in the multimodal API. If you deployed before those controls
+were added, read [If you deployed an earlier version](./docs/Security.md#if-you-deployed-an-earlier-version).
+
+To report a security issue, see [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications).
 
 ## License
 
