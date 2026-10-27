@@ -179,12 +179,45 @@ Merged 12 upstream commits including security fixes, dependency bumps, and the d
 
 ---
 
+### 10. Prompt Caching Dedup — Safe Multi-Client Coexistence
+
+When `ENABLE_PROMPT_CACHING=true` is set for OpenWebUI (which sends no client-side caching markers), clients like ZooCode that send their own `cache_control: {"type": "ephemeral"}` markers would get **duplicate `cachePoint` blocks** — one from the client markers (Mechanism A) and one from the server-side auto-injection (Mechanism B). Bedrock tolerates duplicates but they waste cache checkpoint slots (limit: 4 per request) and cause unnecessary cache-write charges.
+
+**Fix:**
+- `_request_has_client_cache_markers()` — scans incoming messages for `cache_control` markers
+- In `_parse_system_prompts()` and `_parse_messages()`: if client markers detected, skip server-side auto-injection
+- `extra_body.prompt_caching` per-request override still takes precedence
+
+**Result:** `ENABLE_PROMPT_CACHING=true` is safe to use in production. ZooCode gets Mechanism A, OpenWebUI gets Mechanism B, blueai-llm uses `extra_body` — all from a single BAG instance, no duplicate cachePoints.
+
+**Files:** `src/api/models/bedrock.py`
+**Tests:** `test/test_cache_point_dedup.py` (13 tests covering the 4-cell matrix)
+**Commits:** `323aa4a`
+
+---
+
+### 11. Prompt Caching Model Gating
+
+Client-side `cache_control` markers were being converted to `cachePoint` blocks for ALL models, but only Claude and Nova support prompt caching. Models like Qwen, DeepSeek, and Llama reject `cachePoint` with `AccessDeniedException: did not allow prompt caching`.
+
+**Fix (two layers, same pattern as adaptive thinking):**
+1. **Proactive**: `_parse_content_parts()` and `_parse_system_prompts()` now check `_supports_prompt_caching()` before converting `cache_control` → `cachePoint`. Markers are silently dropped for unsupported models.
+2. **Reactive**: If a model unexpectedly rejects caching, `_invoke_bedrock()` catches the error, strips all `cachePoint` blocks via `_strip_cache_points()`, retries the request, and adds the model to a runtime `NO_CACHE_MODELS` set so future requests skip caching entirely.
+
+**Files:** `src/api/models/bedrock.py`
+**Tests:** `test/test_cache_model_gating.py`
+**Commits:** `ed8ec16`
+
+---
+
 ## All Fork-Specific Commits
 
 Listed newest-first. Excludes commits that exist in `upstream/main`.
 
 | Commit | Description | Feature |
 |--------|-------------|---------|
+| `ed8ec16` | fix: model-gating for cachePoint + catch-and-retry for unsupported models | Model gating |
+| `323aa4a` | fix: skip server-side cachePoint when client sends cache_control markers | Dedup fix |
 | `637cde2` | merge: upstream/main (12 commits) | Upstream sync |
 | `5c4cfc3` | fix: auto-detect and retry with adaptive thinking | Adaptive thinking |
 | `76caaf6` | fix: tool call streaming — correct index mapping + empty-arg handling | Tool call fix |
@@ -223,6 +256,7 @@ Listed newest-first. Excludes commits that exist in `upstream/main`.
 | `USAGE_CHAT_ID_HEADER` | `""` | HTTP header for chat/session ID in USAGE logs |
 | `INFERENCE_PROFILE_REGIONS` | `""` (all) | Comma-separated region prefixes to filter inference profiles |
 | `ADAPTIVE_THINKING_MODELS` | `""` | Comma-separated model IDs to pre-seed adaptive thinking cache |
+| `ENABLE_PROMPT_CACHING` | `false` | Enable server-side prompt caching (safe with all clients — dedup fix prevents duplicates) |
 
 ---
 
