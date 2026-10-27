@@ -436,6 +436,20 @@ class BedrockModel(BaseChatModel):
 
         return None
 
+    def _request_has_client_cache_markers(self, chat_request: ChatRequest) -> bool:
+        """Check if the incoming request already contains cache_control markers.
+
+        When a client (e.g., ZooCode) sends cache_control markers on content blocks,
+        the server-side auto-injection (ENABLE_PROMPT_CACHING) should be skipped to
+        avoid duplicate cachePoint blocks in the Bedrock Converse payload.
+        """
+        for msg in chat_request.messages:
+            if hasattr(msg, "content") and isinstance(msg.content, list):
+                for part in msg.content:
+                    if hasattr(part, "cache_control") and part.cache_control is not None:
+                        return True
+        return False
+
     @staticmethod
     def _is_adaptive_thinking_required_error(error_message: str) -> bool:
         """Detect Bedrock's "use adaptive thinking instead" validation error.
@@ -770,6 +784,14 @@ class BedrockModel(BaseChatModel):
                 # extra_body explicitly controls caching
                 cache_enabled = prompt_caching.get("system") is True
 
+        # Skip server-side auto-inject if client already placed cache markers
+        if cache_enabled and self._request_has_client_cache_markers(chat_request):
+            logger.debug(
+                "Client-side cache markers detected; skipping server-side "
+                "auto-inject for model %s", chat_request.model,
+            )
+            return system_prompts  # already has cachePoints from client markers
+
         if not cache_enabled:
             return system_prompts
 
@@ -1023,6 +1045,14 @@ class BedrockModel(BaseChatModel):
                 prompt_caching = chat_request.extra_body.get("prompt_caching", {})
                 if "messages" in prompt_caching:
                     cache_enabled = prompt_caching.get("messages") is True
+
+            # Skip server-side auto-inject if client already placed cache markers
+            if cache_enabled and self._request_has_client_cache_markers(chat_request):
+                logger.debug(
+                    "Client-side cache markers detected in messages; skipping "
+                    "server-side auto-inject for model %s", chat_request.model,
+                )
+                cache_enabled = False
 
             if cache_enabled:
                 # Add cachePoint to the last user message content
