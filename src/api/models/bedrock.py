@@ -125,6 +125,11 @@ NO_ASSISTANT_PREFILL_MODELS = {
 # new Claude generations.
 ADAPTIVE_THINKING_MODELS: set[str] = set()
 
+# Models that have been learned at runtime to NOT support prompt caching.
+# Populated when Bedrock returns an error indicating caching is not supported.
+# Follows the same runtime-learning pattern as ADAPTIVE_THINKING_MODELS.
+NO_CACHE_MODELS: set[str] = set()
+
 
 def _profile_matches_region_filter(profile_id: str) -> bool:
     """Check if a SYSTEM_DEFINED profile ID matches the INFERENCE_PROFILE_REGIONS filter.
@@ -392,6 +397,11 @@ class BedrockModel(BaseChatModel):
         """
         # Resolve profile to underlying model for feature detection
         resolved_model = self._resolve_to_foundation_model(model_id)
+
+        # Check runtime-learned set of models that don't support caching
+        if resolved_model in NO_CACHE_MODELS:
+            return False
+
         model_lower = resolved_model.lower()
 
         # Claude models pattern matching
@@ -468,6 +478,30 @@ class BedrockModel(BaseChatModel):
             "thinking.type.enabled" in error_message
             and "adaptive" in error_message
         )
+
+    @staticmethod
+    def _is_cache_not_supported_error(error_message: str) -> bool:
+        """Detect Bedrock's 'prompt caching not supported' error.
+
+        Models that don't support prompt caching (e.g. Qwen, DeepSeek, Llama)
+        return an ``AccessDeniedException`` with this message when cachePoint
+        blocks are present in the request.
+        """
+        return "did not allow prompt caching" in error_message.lower()
+
+    def _strip_cache_points(self, args: dict) -> dict:
+        """Remove all cachePoint blocks from Converse API arguments.
+
+        Used for retry after discovering a model doesn't support caching.
+        Mutates and returns ``args`` for convenience.
+        """
+        if "system" in args:
+            args["system"] = [b for b in args["system"] if "cachePoint" not in b]
+        if "messages" in args:
+            for msg in args["messages"]:
+                if "content" in msg and isinstance(msg["content"], list):
+                    msg["content"] = [b for b in msg["content"] if "cachePoint" not in b]
+        return args
 
     @staticmethod
     def _uses_legacy_reasoning_config(args: dict) -> bool:
@@ -620,8 +654,45 @@ class BedrockModel(BaseChatModel):
             logger.warning("Bedrock throttling for model %s: %s", chat_request.model, str(e))
             raise HTTPException(status_code=429, detail=str(e))
         except Exception as e:
-            logger.error("Bedrock invocation failed for model %s: %s", chat_request.model, str(e))
-            raise HTTPException(status_code=500, detail=str(e))
+            # Catch prompt-caching rejection (AccessDeniedException) and retry
+            # without cachePoints, then learn so future requests skip injection.
+            if self._is_cache_not_supported_error(str(e)):
+                logger.warning(
+                    "Model %s does not support prompt caching; "
+                    "retrying without cachePoints. Original error: %s",
+                    chat_request.model,
+                    str(e),
+                )
+                args = self._strip_cache_points(args)
+                # Learn for future requests
+                resolved_model = self._resolve_to_foundation_model(chat_request.model)
+                if resolved_model not in NO_CACHE_MODELS:
+                    NO_CACHE_MODELS.add(resolved_model)
+                    logger.info(
+                        "Learned that %s does not support prompt caching; "
+                        "future requests will skip cachePoint injection.",
+                        resolved_model,
+                    )
+                try:
+                    if stream:
+                        response = await run_in_threadpool(
+                            bedrock_runtime.converse_stream, **args
+                        )
+                    else:
+                        response = await run_in_threadpool(
+                            bedrock_runtime.converse, **args
+                        )
+                except Exception as e2:
+                    logger.error(
+                        "Bedrock invocation failed for model %s even after "
+                        "stripping cachePoints: %s",
+                        chat_request.model,
+                        str(e2),
+                    )
+                    raise HTTPException(status_code=500, detail=str(e2))
+            else:
+                logger.error("Bedrock invocation failed for model %s: %s", chat_request.model, str(e))
+                raise HTTPException(status_code=500, detail=str(e))
         return response
 
     async def chat(self, chat_request: ChatRequest) -> ChatResponse:
@@ -761,8 +832,9 @@ class BedrockModel(BaseChatModel):
                 for part in message.content:
                     if hasattr(part, "text"):
                         system_prompts.append({"text": part.text})
-                        # Bedrock tagged unions require cachePoint as a SEPARATE block
-                        if hasattr(part, "cache_control") and part.cache_control is not None:
+                        # Only convert cache_control to cachePoint if model supports it
+                        if (hasattr(part, "cache_control") and part.cache_control is not None
+                                and self._supports_prompt_caching(chat_request.model)):
                             system_prompts.append({"cachePoint": {"type": "default"}})
             else:
                 raise TypeError(f"System message content must be a string or list, got {type(message.content).__name__}")
@@ -1539,8 +1611,9 @@ class BedrockModel(BaseChatModel):
         for part in message.content:
             if isinstance(part, TextContent):
                 content_parts.append({"text": part.text})
-                # Bedrock tagged unions require cachePoint as a SEPARATE block
-                if hasattr(part, "cache_control") and part.cache_control is not None:
+                # Only convert cache_control to cachePoint if model supports it
+                if (hasattr(part, "cache_control") and part.cache_control is not None
+                        and self._supports_prompt_caching(model_id)):
                     content_parts.append({"cachePoint": {"type": "default"}})
             elif isinstance(part, ImageContent):
                 if not self.is_supported_modality(model_id, modality="IMAGE"):
