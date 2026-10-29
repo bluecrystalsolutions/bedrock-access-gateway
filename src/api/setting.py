@@ -38,7 +38,8 @@ INFERENCE_PROFILE_REGIONS: list[str] = (
 
 # HTTP headers to extract for USAGE logging (configurable for different frontends).
 # Leave unset to omit user/chat from USAGE lines. Set to the header names your
-# upstream proxy sends, e.g. USAGE_USER_HEADER=x-openwebui-user-email
+# upstream proxy sends; for OpenWebUI (ENABLE_FORWARD_USER_INFO_HEADERS):
+# USAGE_USER_HEADER=x-openwebui-user-email, USAGE_CHAT_ID_HEADER=x-openwebui-chat-id
 USAGE_USER_HEADER = os.environ.get("USAGE_USER_HEADER", "")
 USAGE_CHAT_ID_HEADER = os.environ.get("USAGE_CHAT_ID_HEADER", "")
 

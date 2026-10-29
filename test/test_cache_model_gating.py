@@ -1,4 +1,4 @@
-"""Unit tests for cachePoint model-gating fix.
+"""Unit tests for cachePoint model gating.
 
 Tests that non-caching models (Qwen, DeepSeek, etc.) never get cachePoint
 blocks, and that the runtime-learning set NO_CACHE_MODELS works correctly.

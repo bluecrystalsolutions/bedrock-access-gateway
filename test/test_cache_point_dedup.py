@@ -1,4 +1,4 @@
-"""Unit tests for cachePoint deduplication fix.
+"""Unit tests for cachePoint deduplication.
 
 Tests the 4-cell matrix of (client_markers × ENABLE_PROMPT_CACHING) for both
 _parse_system_prompts and _parse_messages, plus extra_body override.

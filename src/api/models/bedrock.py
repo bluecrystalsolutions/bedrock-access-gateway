@@ -1,7 +1,6 @@
 import base64
 import json
 import logging
-
 import re
 import time
 from abc import ABC
@@ -46,8 +45,8 @@ from api.schema import (
 from api.setting import (
     AWS_REGION,
     DEFAULT_MODEL,
-    ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_APPLICATION_INFERENCE_PROFILES,
+    ENABLE_CROSS_REGION_INFERENCE,
     ENABLE_PROMPT_CACHING,
     INFERENCE_PROFILE_REGIONS,
     TRACE_LEVEL,
@@ -109,20 +108,11 @@ NO_ASSISTANT_PREFILL_MODELS = {
     "claude-opus-4-6",
 }
 
-# Learned cache of resolved foundation-model IDs that have been observed to
-# reject the legacy `reasoning_config={"type":"enabled",...}` extended
-# thinking scheme and require the newer `thinking.type=adaptive` +
-# `output_config.effort` scheme instead (see _invoke_bedrock's retry logic).
-#
-# This is NOT a hardcoded list — it starts empty and is populated at
-# runtime the first time a given model 400s with Bedrock's "use adaptive
-# thinking instead" error. From then on (for the lifetime of this process),
-# _parse_request consults this set and builds the adaptive-scheme request
-# directly, skipping the failed-attempt round trip for every subsequent
-# request to that model. This keeps the one-extra-request cost to "once per
-# model per process restart" rather than "every single request", while
-# still requiring no manual model-version maintenance as Anthropic ships
-# new Claude generations.
+# Resolved foundation-model IDs that require the `thinking.type=adaptive` +
+# `output_config.effort` scheme instead of the legacy `reasoning_config`.
+# Starts empty and is populated at runtime when Bedrock returns its "use adaptive
+# thinking" error (see _invoke_bedrock); _parse_request then builds the adaptive
+# request directly for these models for the lifetime of the process.
 ADAPTIVE_THINKING_MODELS: set[str] = set()
 
 # Models that have been learned at runtime to NOT support prompt caching.
@@ -449,7 +439,7 @@ class BedrockModel(BaseChatModel):
     def _request_has_client_cache_markers(self, chat_request: ChatRequest) -> bool:
         """Check if the incoming request already contains cache_control markers.
 
-        When a client (e.g., ZooCode) sends cache_control markers on content blocks,
+        When a client sends ``cache_control`` markers on content blocks,
         the server-side auto-injection (ENABLE_PROMPT_CACHING) should be skipped to
         avoid duplicate cachePoint blocks in the Bedrock Converse payload.
         """
@@ -464,15 +454,11 @@ class BedrockModel(BaseChatModel):
     def _is_adaptive_thinking_required_error(error_message: str) -> bool:
         """Detect Bedrock's "use adaptive thinking instead" validation error.
 
-        Newer Claude generations (observed starting with Opus 4.7/4.8 and
-        all Sonnet/Opus/Haiku 5.x models) reject the legacy
-        ``thinking.type=enabled`` / ``reasoning_config`` scheme with this
-        specific message, and ask callers to use
+        Newer Claude models reject the legacy ``thinking.type=enabled`` /
+        ``reasoning_config`` scheme with this message and ask callers to use
         ``thinking.type=adaptive`` + ``output_config.effort`` instead.
-        Matching on the message (rather than a hardcoded model-id list)
-        keeps this working automatically as Anthropic ships new model
-        generations with unpredictable version numbers (e.g. opus-4-6 and
-        opus-4-8 are on opposite sides of this split).
+        Matching on the message rather than a model list keeps this working
+        for future models.
         """
         return (
             "thinking.type.enabled" in error_message
@@ -521,19 +507,9 @@ class BedrockModel(BaseChatModel):
         not take a budget_tokens value - effort is a coarse low/medium/high
         knob instead.
 
-        ``display: "summarized"`` is REQUIRED to get non-empty
-        ``reasoningContent.text`` back from Bedrock. Without it, Bedrock
-        still emits signed reasoning blocks (contentBlockStart +
-        contentBlockDelta + signature), but the ``text`` field inside is
-        always empty - confirmed via a direct boto3 converse_stream A/B
-        test (bypassing both this gateway and ZooCode) on
-        2026-10-24: identical requests differing only in the presence of
-        this field went from 0 chars of reasoning text to 756 chars.
-        ZooCode's own direct-Bedrock provider (src/api/providers/bedrock.ts)
-        has always set this field; this gateway's adaptive-thinking path
-        did not, which is why reasoning text appeared empty when routed
-        through this gateway. See ZOOCODE_ANALYSIS.md (doc-repo) for the
-        full investigation write-up.
+        ``display: "summarized"`` is required for Bedrock to return non-empty
+        ``reasoningContent.text``; without it reasoning blocks are signed but
+        their text is empty.
         """
         return {
             "thinking": {"type": "adaptive", "display": "summarized"},
@@ -556,38 +532,38 @@ class BedrockModel(BaseChatModel):
         # convert OpenAI chat request to Bedrock SDK request
         args = self._parse_request(chat_request)
 
-        # DIAG: Log Bedrock message structure summary before sending
-        bedrock_msgs = args.get("messages", [])
-        diag_summary = []
-        for i, msg in enumerate(bedrock_msgs):
-            role = msg.get("role", "?")
-            content = msg.get("content", [])
-            content_types = []
-            tool_use_ids = []
-            tool_result_ids = []
-            for block in (content if isinstance(content, list) else []):
-                if isinstance(block, dict):
-                    if "text" in block:
-                        content_types.append("text")
-                    elif "toolUse" in block:
-                        content_types.append("toolUse")
-                        tool_use_ids.append(block["toolUse"].get("toolUseId", "?"))
-                    elif "toolResult" in block:
-                        content_types.append("toolResult")
-                        tool_result_ids.append(block["toolResult"].get("toolUseId", "?"))
-                    elif "cachePoint" in block:
-                        content_types.append("cachePoint")
-                    else:
-                        content_types.append("unknown:" + ",".join(block.keys()))
-            diag_summary.append(
-                f"[{i}] role={role} blocks={content_types} toolUseIds={tool_use_ids} toolResultIds={tool_result_ids}"
-            )
-        logger.warning(
-            "DIAG-BEDROCK | model=%s | bedrock_msg_count=%d | structure:\n%s",
-            chat_request.model, len(bedrock_msgs), "\n".join(diag_summary),
-        )
-
         if logger.isEnabledFor(logging.DEBUG):
+            # Summarise the Bedrock request structure (block types and IDs only, no content)
+            bedrock_msgs = args.get("messages", [])
+            system_types = [",".join(b.keys()) for b in args.get("system", []) if isinstance(b, dict)]
+            structure_lines = [f"system blocks={system_types}"]
+            for i, msg in enumerate(bedrock_msgs):
+                role = msg.get("role", "?")
+                content = msg.get("content", [])
+                content_types = []
+                tool_use_ids = []
+                tool_result_ids = []
+                for block in (content if isinstance(content, list) else []):
+                    if isinstance(block, dict):
+                        if "text" in block:
+                            content_types.append("text")
+                        elif "toolUse" in block:
+                            content_types.append("toolUse")
+                            tool_use_ids.append(block["toolUse"].get("toolUseId", "?"))
+                        elif "toolResult" in block:
+                            content_types.append("toolResult")
+                            tool_result_ids.append(block["toolResult"].get("toolUseId", "?"))
+                        elif "cachePoint" in block:
+                            content_types.append("cachePoint")
+                        else:
+                            content_types.append("unknown:" + ",".join(block.keys()))
+                structure_lines.append(
+                    f"[{i}] role={role} blocks={content_types} toolUseIds={tool_use_ids} toolResultIds={tool_result_ids}"
+                )
+            logger.debug(
+                "Bedrock request structure | model=%s | messages=%d\n%s",
+                chat_request.model, len(bedrock_msgs), "\n".join(structure_lines),
+            )
             logger.debug("Bedrock request: " + json.dumps(str(args)))
 
         try:
@@ -600,13 +576,9 @@ class BedrockModel(BaseChatModel):
                 # Run the blocking boto3 call in a thread pool
                 response = await run_in_threadpool(bedrock_runtime.converse, **args)
         except bedrock_runtime.exceptions.ValidationException as e:
-            # Newer Claude generations (e.g. Opus 4.7+, Sonnet 5+) only support
-            # Bedrock's "adaptive" thinking mode and reject the legacy
-            # reasoning_config={"type": "enabled", ...} scheme we build by
-            # default for reasoning_effort requests. Rather than hardcoding a
-            # model-version allow-list (which goes stale the moment the next
-            # Claude generation ships), detect AWS's own error message and
-            # retry once with the new scheme.
+            # Some Claude models accept only the adaptive thinking scheme and
+            # reject the legacy reasoning_config. Detect Bedrock's error
+            # message and retry once with the adaptive scheme.
             if self._is_adaptive_thinking_required_error(
                 str(e)
             ) and self._uses_legacy_reasoning_config(args):
@@ -920,12 +892,12 @@ class BedrockModel(BaseChatModel):
                 elif message.content is not None:
                     has_content = True
 
-                # DIAG: Log assistant message parsing decisions
-                tool_call_ids = [tc.id for tc in message.tool_calls] if message.tool_calls else []
-                logger.warning(
-                    "DIAG-PARSE[%d] | role=assistant | content_type=%s | has_content=%s | tool_calls=%s | tool_call_ids=%s",
-                    idx, type(message.content).__name__, has_content, bool(message.tool_calls), tool_call_ids,
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    tool_call_ids = [tc.id for tc in message.tool_calls] if message.tool_calls else []
+                    logger.debug(
+                        "Assistant message %d | content_type=%s | has_content=%s | tool_calls=%s | ids=%s",
+                        idx, type(message.content).__name__, has_content, bool(message.tool_calls), tool_call_ids,
+                    )
 
                 if has_content:
                     # Text message
@@ -1208,12 +1180,9 @@ class BedrockModel(BaseChatModel):
                 inference_config.pop("topP", None)
 
                 if resolved_model in ADAPTIVE_THINKING_MODELS:
-                    # Previously learned (this process) that this model only
-                    # accepts the newer adaptive-thinking scheme - build it
-                    # directly and skip the doomed legacy attempt + retry
-                    # round trip. See ADAPTIVE_THINKING_MODELS and
-                    # _invoke_bedrock's retry logic for how this gets
-                    # populated.
+                    # Model already learned (this process) to require adaptive
+                    # thinking; build it directly and skip the legacy attempt.
+                    # See ADAPTIVE_THINKING_MODELS and _invoke_bedrock.
                     args["additionalModelRequestFields"] = self._build_adaptive_thinking_fields(
                         chat_request.reasoning_effort
                     )
@@ -1417,8 +1386,8 @@ class BedrockModel(BaseChatModel):
                 # Map Bedrock contentBlockIndex to sequential 0-based tool_calls index.
                 # Bedrock numbers ALL content blocks (text, reasoning, tool_use) with
                 # contentBlockIndex, but OpenAI tool_calls[].index must be 0-based
-                # across tool calls only.  The old ``- 1`` assumed index-0 is always
-                # text, which fails when the model emits a tool call first (index=-1).
+                # across tool calls only. Index 0 is not always text; a model may
+                # emit a tool call as its first block.
                 block_idx = chunk["contentBlockStart"]["contentBlockIndex"]
                 index = self._next_tool_index
                 self._tool_call_index_map[block_idx] = index
@@ -1485,8 +1454,8 @@ class BedrockModel(BaseChatModel):
 
         if "contentBlockStop" in chunk:
             # If a tool call block ended with no non-empty argument deltas,
-            # emit a synthetic "{}" so clients (e.g. pipecat) that require
-            # truthy arguments see valid empty-object JSON.
+            # emit a synthetic "{}" so clients that require non-empty
+            # arguments see valid empty-object JSON.
             block_idx = chunk["contentBlockStop"]["contentBlockIndex"]
             if block_idx in self._tool_call_index_map and not self._tool_call_has_args.get(block_idx, False):
                 tool_idx = self._tool_call_index_map[block_idx]

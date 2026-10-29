@@ -14,7 +14,7 @@ from api.schema import CacheControl, ChatRequest, SystemMessage, TextContent, Us
 
 
 # ---------------------------------------------------------------------------
-# Shared test fixtures and helpers for BAG cache tests
+# Shared test fixtures and helpers for prompt-caching tests
 # ---------------------------------------------------------------------------
 
 # A Claude model that supports prompt caching
@@ -58,7 +58,7 @@ def make_chat_request_no_markers(model: str = CLAUDE_MODEL) -> ChatRequest:
 
 
 def make_chat_request_with_markers(model: str = CLAUDE_MODEL) -> ChatRequest:
-    """ChatRequest with cache_control markers on content blocks (ZooCode-style)."""
+    """ChatRequest with cache_control markers on content blocks (client-side markers)."""
     return ChatRequest(
         model=model,
         messages=[
