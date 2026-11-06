@@ -149,6 +149,49 @@ Only some models (Claude, Nova) support prompt caching; others (e.g. Qwen, DeepS
 
 ---
 
+### 11. Visible Content-Filter Responses
+
+Bedrock can return a `content_filtered` stop reason with zero output tokens for certain input text. Previously the stream loop ended silently with no visible content, which looks to a client like an empty/hung turn. Now, if a turn ends with `finish_reason=content_filter` and no text or tool calls were emitted, a visible `[Blocked by provider content filter]` message is emitted instead.
+
+**Files:** `src/api/models/bedrock.py`
+**Tests:** `test/test_content_filter_visible.py`
+
+---
+
+### 12. Duplicate `toolResult` Deduplication
+
+Bedrock rejects a request with a 400 `ValidationException` if two `toolResult` blocks share the same `toolUseId` (e.g. a client retrying and resubmitting an already-answered tool call). `_parse_messages()` now tracks `toolUseId`s already converted to a `toolResult` block and drops any later duplicates, keeping the first occurrence, so the request Bedrock receives never contains duplicate Ids.
+
+**Files:** `src/api/models/bedrock.py`
+**Tests:** `test/test_tool_result_dedup.py`
+
+---
+
+### 13. Thinking Tag Closed Before Tool Calls
+
+The streaming `</think>` close tag was only emitted from the text-delta, signature-delta, and `messageStop` branches. If a `toolUse` block started immediately after a reasoning block with no intervening signature delta, the close tag was never emitted before the tool call content, leaving an unclosed `<think>` tag around tool-call output. Both `toolUse` start and argument-delta branches now check for an open thinking tag and close it first, matching the existing branches.
+
+**Files:** `src/api/models/bedrock.py`
+**Tests:** `test/test_think_close_before_tool.py`
+
+---
+
+### 14. Optional Tool-Feedback Splitting (`BAG_SPLIT_TOOL_FEEDBACK`)
+
+Some clients implement an approve/deny workflow where free-text feedback typed alongside an approval/denial is merged directly into the same `tool_result` content as the tool's real output, with no structural separator. Models tend to treat text embedded in tool output as untrusted and ignore it. With `BAG_SPLIT_TOOL_FEEDBACK=1`, a leading `{"status": "approved"|"denied", "feedback": "..."}` JSON blob is detected and split out of the `toolResult` content into a separate text block in the same turn, so the feedback is seen as a normal instruction rather than tool output.
+
+- Disabled by default; opt-in only
+- No effect when the `toolResult` content does not start with a matching JSON blob
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BAG_SPLIT_TOOL_FEEDBACK` | `false` | Split leading approve/deny feedback JSON out of `toolResult` content into a separate text block |
+
+**Files:** `src/api/models/bedrock.py`
+**Tests:** `test/test_tool_feedback_split.py`
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -160,6 +203,7 @@ Only some models (Claude, Nova) support prompt caching; others (e.g. Qwen, DeepS
 | `USAGE_CHAT_ID_HEADER` | `""` | HTTP header carrying the chat/session ID in USAGE logs (OpenWebUI: `x-openwebui-chat-id`) |
 | `INFERENCE_PROFILE_REGIONS` | `""` (all) | Comma-separated region prefixes to filter inference profiles |
 | `ENABLE_PROMPT_CACHING` | `false` | Enable server-side prompt caching; skipped when the request already contains `cache_control` markers |
+| `BAG_SPLIT_TOOL_FEEDBACK` | `false` | Split leading approve/deny feedback JSON out of `toolResult` content into a separate text block |
 
 ---
 

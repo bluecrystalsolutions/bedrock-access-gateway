@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import os
 import re
 import time
 from abc import ABC
@@ -737,6 +738,12 @@ class BedrockModel(BaseChatModel):
             self._next_tool_index = 0
             self._tool_call_has_args = {}    # contentBlockIndex -> True if non-empty args received
             reasoning_tokens = 0
+            # Tracks whether any visible content (text or tool_calls) has been
+            # emitted for this turn yet. Used to detect a Bedrock
+            # content_filtered stop that produced zero visible output, which
+            # would otherwise silently end the stream with an empty-content
+            # finish_reason chunk and no indication to the caller of why.
+            content_emitted = False
             async for chunk in self._async_iterate(stream):
                 # Accumulate reasoning tokens from delta chunks before processing
                 if "contentBlockDelta" in chunk:
@@ -755,6 +762,24 @@ class BedrockModel(BaseChatModel):
                         reasoning_tokens=reasoning_tokens,
                         audio_tokens=0,
                     )
+
+                if stream_response.choices:
+                    choice = stream_response.choices[0]
+                    # A Bedrock content_filtered stop with zero visible output
+                    # must not pass through as a silent, empty-content chunk --
+                    # surface a visible message instead so the caller sees why
+                    # the turn ended, rather than an empty assistant reply that
+                    # can trigger retry logic (and, with pending tool calls,
+                    # duplicate tool-result resubmissions on the retry).
+                    if (
+                        choice.finish_reason == "content_filter"
+                        and not content_emitted
+                        and not choice.delta.content
+                        and not choice.delta.tool_calls
+                    ):
+                        choice.delta.content = "[Blocked by provider content filter]"
+                    if choice.delta.content or choice.delta.tool_calls:
+                        content_emitted = True
 
                 if logger.isEnabledFor(TRACE_LEVEL):
                     logger.log(TRACE_LEVEL, "Proxy response :" + stream_response.model_dump_json())
@@ -872,6 +897,13 @@ class BedrockModel(BaseChatModel):
         https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html#message-inference-examples
         """
         messages = []
+        # Tracks toolUseId values already emitted as a toolResult block, so a
+        # duplicate tool_result for the same tool_call_id (e.g. a calling
+        # client's retry logic resubmitting after an empty-reply retry) is
+        # dropped before the Bedrock request is built -- Bedrock rejects
+        # duplicate toolResult Ids with a 400 ValidationException. The first
+        # occurrence is kept.
+        seen_tool_use_ids: set[str] = set()
         for idx, message in enumerate(chat_request.messages):
             if isinstance(message, UserMessage):
                 messages.append(
@@ -932,20 +964,45 @@ class BedrockModel(BaseChatModel):
                 # Add toolResult to content
                 # https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolResultBlock.html
 
+                # Drop duplicate tool_result blocks for a toolUseId already
+                # emitted earlier in this request -- see seen_tool_use_ids
+                # above. Keeps the first occurrence, skips any later ones.
+                if message.tool_call_id in seen_tool_use_ids:
+                    logger.warning(
+                        "Dropping duplicate toolResult for toolUseId %s",
+                        message.tool_call_id,
+                    )
+                    continue
+                seen_tool_use_ids.add(message.tool_call_id)
+
                 # Handle different content formats from OpenAI SDK
                 tool_content = self._extract_tool_content(message.content)
+
+                # Opt-in workaround (BAG_SPLIT_TOOL_FEEDBACK=1): some calling
+                # clients glue approve/deny-style human feedback in front of
+                # (or merged with) the tool's real output, all as the content
+                # of a single toolResult block. Models tend to treat text
+                # embedded in tool output as untrusted and ignore it. When
+                # enabled, split any detected feedback text out of the
+                # toolResult content and append it as a separate text block
+                # in the same Bedrock user turn.
+                tool_content_block = {
+                    "toolResult": {
+                        "toolUseId": message.tool_call_id,
+                        "content": [{"text": tool_content}],
+                    }
+                }
+                content_blocks = [tool_content_block]
+                if os.environ.get("BAG_SPLIT_TOOL_FEEDBACK", "false").lower() not in ("false", "0", ""):
+                    tool_content, feedback_text = self._split_tool_feedback(tool_content)
+                    tool_content_block["toolResult"]["content"] = [{"text": tool_content}]
+                    if feedback_text:
+                        content_blocks.append({"text": feedback_text})
 
                 messages.append(
                     {
                         "role": "user",
-                        "content": [
-                            {
-                                "toolResult": {
-                                    "toolUseId": message.tool_call_id,
-                                    "content": [{"text": tool_content}],
-                                }
-                            }
-                        ],
+                        "content": content_blocks,
                     }
                 )
 
@@ -953,6 +1010,39 @@ class BedrockModel(BaseChatModel):
                 # ignore others, such as system messages
                 continue
         return self._reframe_multi_payloard(messages, chat_request)
+
+    def _split_tool_feedback(self, tool_content: str) -> tuple[str, str | None]:
+        """Opt-in workaround (BAG_SPLIT_TOOL_FEEDBACK=1): detect a leading
+        ``{"status": "approved"|"denied", "feedback": "..."}`` JSON blob glued
+        in front of a tool's real output and split the feedback text out.
+
+        Some calling clients implement an approve/deny workflow where
+        free-text feedback typed alongside an approval/denial is merged into
+        the same tool_result content as the tool's actual output, with no
+        structural separator. Claude models tend to treat text embedded in
+        tool output as untrusted/injected content and ignore it, so this
+        splits the feedback out into a separate text block instead.
+
+        Returns a tuple of (remaining_tool_content, feedback_text_or_None).
+        If no leading feedback JSON blob is detected, returns the original
+        content unchanged and None for the feedback.
+        """
+        stripped = tool_content.lstrip()
+        if not stripped.startswith("{"):
+            return tool_content, None
+        try:
+            obj, end_idx = json.JSONDecoder().raw_decode(stripped)
+        except json.JSONDecodeError:
+            return tool_content, None
+        if not isinstance(obj, dict):
+            return tool_content, None
+        if obj.get("status") not in ("approved", "denied"):
+            return tool_content, None
+        feedback_text = obj.get("feedback")
+        if not isinstance(feedback_text, str) or not feedback_text:
+            return tool_content, None
+        remainder = stripped[end_idx:].lstrip("\n")
+        return remainder, feedback_text
 
     def _extract_tool_content(self, content) -> str:
         """Extract text content from various OpenAI SDK tool message formats.
@@ -1392,7 +1482,18 @@ class BedrockModel(BaseChatModel):
                 index = self._next_tool_index
                 self._tool_call_index_map[block_idx] = index
                 self._next_tool_index += 1
+                # Close any still-open thinking tag before a tool call starts.
+                # Mirrors the close-tag handling in the text-delta and
+                # signature-delta branches below -- a tool_use block may start
+                # immediately after a reasoning block with no intervening
+                # signature delta, in which case this is the only place the
+                # close tag would ever be emitted before messageStop.
+                tool_start_content = None
+                if self.think_emitted:
+                    tool_start_content = "</think>"
+                    self.think_emitted = False
                 message = ChatResponseMessage(
+                    content=tool_start_content,
                     tool_calls=[
                         ToolCall(
                             index=index,
@@ -1441,7 +1542,15 @@ class BedrockModel(BaseChatModel):
                 # synthetic "{}" is emitted at contentBlockStop if needed.
                 if tool_arguments:
                     self._tool_call_has_args[block_idx] = True
+                    # Close any still-open thinking tag before tool-use
+                    # argument deltas stream (mirrors the contentBlockStart
+                    # toolUse branch above).
+                    tool_delta_content = None
+                    if self.think_emitted:
+                        tool_delta_content = "</think>"
+                        self.think_emitted = False
                     message = ChatResponseMessage(
+                        content=tool_delta_content,
                         tool_calls=[
                             ToolCall(
                                 index=index,
